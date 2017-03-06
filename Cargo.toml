@@ -1,0 +1,8 @@
+[package]
+name = "sundfs"
+version = "0.1.0"
+authors = ["yuanpx <101954225@qq.com>"]
+
+[dependencies]
+tokio-core = "0.1"
+futures = "0.1.9"
