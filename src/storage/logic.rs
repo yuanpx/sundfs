@@ -27,41 +27,45 @@ use self::futures::sync::mpsc::UnboundedReceiver;
 use self::futures::sync::mpsc;
 use storage::nio::NetCommand;
 use storage::nio::NetEvent;
+use storage::nio::NetService;
 use storage;
 
 pub struct Service {
-    cmd_channel: UnboundedSender<NetCommand>,
-    event_channel: UnboundedReceiver<NetEvent>,
+    cmd_channel: Option<UnboundedSender<NetCommand>>,
 }
 pub trait Process {
-    fn process_event(&mut self, service: &mut Service, ev: NetEvent)
-    {}
+    fn process_init(&mut self, service: &mut Service) {
+    }
+    fn process_event(&mut self, service: &mut Service, ev: NetEvent) {
+    }
 }
 
 impl Service {
-    pub fn new(cmd_channel: UnboundedSender<NetCommand>, event_channel: UnboundedReceiver<NetEvent>) -> Service {
+    pub fn new() -> Service {
         Service{
-            cmd_channel: cmd_channel,
-            event_channel: event_channel,
+            cmd_channel: None,
         }
     }
 
     pub fn listen(&mut self, address: SocketAddr) {
-        self.cmd_channel.send(NetCommand::LISTEN(address)).unwrap();
+        self.cmd_channel.as_mut().unwrap().send(NetCommand::LISTEN(address)).unwrap();
     }
 
     pub fn connect(&mut self, address: SocketAddr) {
-        self.cmd_channel.send(NetCommand::CONNECT(address)).unwrap();
+        self.cmd_channel.as_mut().unwrap().send(NetCommand::CONNECT(address)).unwrap();
     }
 
     pub fn send(&mut self, id: usize, buf: Vec<u8>) {
-        self.cmd_channel.send(NetCommand::SEND((id, buf))).unwrap();
+        self.cmd_channel.as_mut().unwrap().send(NetCommand::SEND((id, buf))).unwrap();
     }
 
     pub fn start<T: Process>(&mut self, process: &mut T) -> Result<()> {
         let mut core = Core::new().unwrap();
-        let (tx, rx) = mpsc::unbounded();
-        let event_process = rx.fold((self, process), move |(service,process), event|{
+        let mut net_service = NetService::new().unwrap();
+        let (cmd_tx, event_rx) = net_service.start().unwrap();
+        self.cmd_channel = Some(cmd_tx);
+        process.process_init(self);
+        let event_process = event_rx.fold((self, process), move |(service,process), event|{
             process.process_event(service, event);
             Ok((service, process))
         }).map(|_|());

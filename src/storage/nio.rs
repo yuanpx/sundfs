@@ -187,16 +187,6 @@ impl NetService{
             let id_source = id.clone();
             let connections_out: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>> =  Rc::new(RefCell::new(HashMap::new()));
             let connections = connections_out.clone();
-/*        let iter = stream::iter(iter::repeat(()).map(Ok::<(), Error>));
-        let timer = iter.fold(0, move |count, _| {
-            let duration = Duration::new(1, 0);
-            let time_out = Timeout::new(duration, &handle).unwrap();
-            time_out.map(move |_|{
-                println!("tick 1s: count {}!", count);
-                count + 1
-            })
-        });
-*/
             let event_tx_inner = event_tx.clone();
             let event_process = cmd_rx.fold(0, move |count, command|{
                 let handle_inner = handle_out.clone();
