@@ -23,56 +23,50 @@ use self::futures::stream;
 use self::futures::stream::Stream;
 use self::futures::Future;
 use self::futures::sync::mpsc::UnboundedSender;
+use self::futures::sync::mpsc::UnboundedReceiver;
 use self::futures::sync::mpsc;
+use storage::nio::NetCommand;
+use storage::nio::NetEvent;
+use storage;
 
-pub trait Service {
-    fn process_event(ev: NetEvent);
+pub struct Service {
+    cmd_channel: UnboundedSender<NetCommand>,
+    event_channel: UnboundedReceiver<NetEvent>,
+}
+pub trait Process {
+    fn process_event(&mut self, service: &mut Service, ev: NetEvent)
+    {}
 }
 
-pub struct EventLoop<T> {
-    pub net: NetService,
-    pub core: Core,
-    service: Option<T>;
-}
-
-
-
-impl <T: Service>EventLoop<T> {
-    pub fn new(t: T) -> EventLoop {
-        net: NetService::new().unwrap(),
-        messages: None,
-        service: Some(t),
+impl Service {
+    pub fn new(cmd_channel: UnboundedSender<NetCommand>, event_channel: UnboundedReceiver<NetEvent>) -> Service {
+        Service{
+            cmd_channel: cmd_channel,
+            event_channel: event_channel,
+        }
     }
 
     pub fn listen(&mut self, address: SocketAddr) {
-        self.net.listen(address);
+        self.cmd_channel.send(NetCommand::LISTEN(address)).unwrap();
     }
 
     pub fn connect(&mut self, address: SocketAddr) {
-        self.net.connect(address);
+        self.cmd_channel.send(NetCommand::CONNECT(address)).unwrap();
     }
 
-    pub fn start(&mut self) -> Result<()> {
-        let handle = self.core.hadnle();
+    pub fn send(&mut self, id: usize, buf: Vec<u8>) {
+        self.cmd_channel.send(NetCommand::SEND((id, buf))).unwrap();
+    }
+
+    pub fn start<T: Process>(&mut self, process: &mut T) -> Result<()> {
+        let mut core = Core::new().unwrap();
         let (tx, rx) = mpsc::unbounded();
-        let event_process = rx.fold(, move |count, (id, buf)|{
-            let handle_inner = handle_out.clone();
-            let id_inner = id_source.clone();
-            let connections_inner = connections.clone();
-            self::process_command(handle_inner, id_inner, connections_inner, command);
-            ok(count + 1)
+        let event_process = rx.fold((self, process), move |(service,process), event|{
+            process.process_event(service, event);
+            Ok((service, process))
         }).map(|_|());
 
-        self.commands = some(tx);
-        let event_process = rx.fold(0, move |count, command|{
-            let handle_inner = handle_out.clone();
-            let id_inner = id_source.clone();
-            let connections_inner = connections.clone();
-            self::process_command(handle_inner, id_inner, connections_inner, command);
-            ok(count + 1)
-        }).map(|_|());
-
-        try!(self.net.start());
-         
+        core.run(event_process).unwrap(); 
+        Ok(())
     }
 }
