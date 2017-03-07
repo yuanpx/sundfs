@@ -9,6 +9,7 @@ use std::io::{Error, ErrorKind};
 use std::time::Duration;
 use std::vec::Vec;
 use std::cell::RefCell;
+use std::cell::Cell;
 extern crate tokio_core;
 use self::tokio_core::net::TcpListener;
 use self::tokio_core::net::TcpStream;
@@ -27,14 +28,22 @@ use self::futures::sync::mpsc;
 pub enum NetCommand {
     LISTEN(SocketAddr),
     CONNECT(SocketAddr),
-    SEND(Vec<u8>),
+    SEND((usize, Vec<u8>)),
+}
+
+pub enum NetEvent {
+    CONNECTED(usize),
+    DISCONNECTED(usize),
+    MESSAGE((usize, Vec<u8>)),
 }
 
 pub struct NetService {
     pub  core: Core,
 //    pub  listener: Rc<TcpListener>,
-    pub connections: Rc<RefCell<HashMap<usize, UnboundedSender<NetCommand>>>>,
-
+    pub connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>,
+    pub commands: Option<UnboundedSender<NetCommand>>,
+    pub id: Rc<Cell<usize>>,
+    pub channel: Option<UnboundedSender<NetEvent>>,
 }
 
 impl NetService{
@@ -43,199 +52,158 @@ impl NetService{
         let mut core = try!(Core::new());
         Ok(NetService{
             core: core,
- //           listener: Rc::new(listener),
-            connections: Rc::new(HashMap::new()),
+            connections: Rc::new(RefCell::new(HashMap::new())),
+            commands: None,
+            id: Rc::new(Cell::new(0)),
+            channel: None,
         })
     }
 
-    pub fn process_command(&mut self, command: NetCommand) {
+    pub fn listen(&mut self, address: SocketAddr) {
+        self.commands.as_mut().unwrap().send(NetCommand::LISTEN(address)).unwrap();
+    }
+
+    pub fn connect(&mut self, address: SocketAddr) {
+        self.commands.as_mut().unwrap().send(NetCommand::CONNECT(address)).unwrap();
+    }
+
+    pub fn send(&mut self, id: usize, buf: Vec<u8>) {
+        self.commands.as_mut().unwrap().send(NetCommand::SEND((id, buf))).unwrap();
+    }
+
+    pub fn process_command(handle: Handle, id_source: Rc<Cell<usize>>,connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, command: NetCommand) {
         match command {
             NetCommand::LISTEN(address) => {
-                self.listen(&address);
+                Self::process_listen(handle, id_source, connections,channel, &address).unwrap();
             },
             NetCommand::CONNECT(address) => {
-                self.connect(&address);
+                Self::process_connect(handle, id_source, connections, channel, &address).unwrap();
             },
-            NetCommand::SEND(buf) => {
+            NetCommand::SEND((id, buf)) => {
+                Self::process_send(id, connections, buf);
                 
             },
-
         }
     }
 
-    pub fn process_stream(id: usize, handle: Handle, stream: TcpStream, connections: Rc<RefCell<HashMap<usize, UnboundedSender<NetCommand>>>>) {
+    pub fn process_stream(id: usize, handle: Handle, stream: TcpStream, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>){
         let handle_inner = handle.clone();
+        let channel_out = channel.clone();
         let (tx, rx) = mpsc::unbounded();
         connections.borrow_mut().insert(id, tx);
         let (reader, writer) = stream.split();
         let iter = stream::iter(iter::repeat(()).map(Ok::<(), Error>));
         //let mut header_vec: Vec<u8> = vec![0;4];
         let mut header_vec: Vec<u8> = vec![0;1];
-        let socket_reader = iter.fold((reader, header_vec), move | (reader, header_vec), _| {
+        let socket_reader = iter.fold((reader, channel, id, header_vec), move | (reader,channel,id, header_vec), _| {
             let header = io::read_exact(reader, header_vec);
-            let header = header.and_then(|(reader, header_vec)|{
+            let header = header.and_then(move|(reader, header_vec)|{
                 if header_vec.len() == 0 {
                     Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
                 } else {
                     
-                    Ok((reader, header_vec))
+                    Ok((reader, channel, id,header_vec))
                 }
             });
             
-            let body = header.and_then(|(reader, header_vec)|{
+            let body = header.and_then(|(reader,channel,id, header_vec)|{
                 let body_len = header_vec[0] as usize; 
                 let mut body_vec = vec![0; body_len];
                 let body_inner = io::read_exact(reader, body_vec);
-                let body_inner = body_inner.and_then(|(reader, body_vec)|{
+                let body_inner = body_inner.and_then(move |(reader, body_vec)|{
                     if body_vec.len() == 0 {
                         Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
                     } else {
-                        Ok((reader, header_vec, body_vec))
+                        Ok((reader, channel,id, header_vec, body_vec))
                     }
                 });
                 body_inner
             });
             
             //let body = body.map(|(reader, vec)| {
-            body.map(|(reader, header_vec, body_vec)| {
+            body.map(|(reader,channel,id, header_vec, body_vec)| {
                 // (reader, String::from_utf8(vec))
-                println!("{:?}", String::from_utf8(body_vec));
-                (reader, header_vec)
+                println!("{:?}", String::from_utf8(body_vec.clone()));
+
+                channel.send(NetEvent::MESSAGE((id, body_vec))).unwrap();
+                (reader, channel,id, header_vec)
             })
         });
+
+        let socket_writer = rx.fold(writer, |writer, msg|{
+            let amt = io::write_all(writer, msg);
+            let amt = amt.map(|(writer, _)| writer);
+            amt.map_err(|_|())
+        }).map(|_|());
         
         let socket_reader = socket_reader.map_err(|_| ());
         let connection = socket_reader.map(|_|());
+        let connection = connection.select(socket_writer);
         handle_inner.spawn(connection.then(move |_|{
+            connections.borrow_mut().remove(&id).unwrap();
+            channel_out.send(NetEvent::DISCONNECTED(id)).unwrap();
             Ok(())
         }));
     }
 
-    pub fn connect(&mut self, address: &SocketAddr) -> Result<()> {
-        let handle = self.core.handle();
-        let stream = TcpStream::connect(address, &handle).map(move |stream| {
-            let (reader, writer) = stream.split();
-            let iter = stream::iter(iter::repeat(()).map(Ok::<(), Error>));
-            //let mut header_vec: Vec<u8> = vec![0;4];
-            let mut header_vec: Vec<u8> = vec![0;1];
-            let socket_reader = iter.fold((reader, header_vec), move | (reader, header_vec), _| {
-                let header = io::read_exact(reader, header_vec);
-                let header = header.and_then(|(reader, header_vec)|{
-                    if header_vec.len() == 0 {
-                        Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
-                    } else {
-                        
-                        Ok((reader, header_vec))
-                    }
-                });
-                
-                let body = header.and_then(|(reader, header_vec)|{
-                    let body_len = header_vec[0] as usize; 
-                    let mut body_vec = vec![0; body_len];
-                    let body_inner = io::read_exact(reader, body_vec);
-                    let body_inner = body_inner.and_then(|(reader, body_vec)|{
-                        if body_vec.len() == 0 {
-                            Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
-                        } else {
-                            Ok((reader, header_vec, body_vec))
-                        }
-                    });
-                    body_inner
-                });
-            
-                //let body = body.map(|(reader, vec)| {
-                body.map(|(reader, header_vec, body_vec)| {
-                    // (reader, String::from_utf8(vec))
-                    println!("{:?}", String::from_utf8(body_vec));
-                    (reader, header_vec)
-                })
-            });
-        
-            let socket_reader = socket_reader.map_err(|_| ());
-            let connection = socket_reader.map(|_|());
-            handle.spawn(connection.then(move |_|{
-                Ok(())
-            }));
+    pub fn process_connect(handle: Handle, id_source: Rc<Cell<usize>>,connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, address: &SocketAddr) -> Result<()> {
+        let id = id_source.get();
+        id_source.set(id + 1);
+        let handle_out = handle.clone();
+         let stream = TcpStream::connect(address, &handle).map(move |stream| {
+             channel.send(NetEvent::CONNECTED(id)).unwrap();
+             Self::process_stream(id, handle, stream, connections, channel);
         });
 
         let stream = stream.map_err(|_|());
         let stream = stream.map(|_|());
-        let handle = self.core.handle();
-        handle.spawn(stream);
+        handle_out.spawn(stream);
         Ok(())
     }
     
-    pub fn listen(&mut self, address: &SocketAddr) -> Result<()> {
-        let handle = self.core.handle();
+    pub fn process_listen(handle: Handle, id_source: Rc<Cell<usize>>, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, address: &SocketAddr) -> Result<()> {
+        let handle_out = handle.clone();
         let mut listener = try!(TcpListener::bind(address, &handle));
-        let srv = listener.incoming().for_each(move|(stream, addr)|{
-            println!("New Connection: {}", addr);
-            let (reader, writer) = stream.split();
-       //     let (tx, rx) = futures::sync::mpsc::unbounded();
-      //      self.connections.insert(addr, tx);
-      //      let connections_inner = self.connections.clone();
-
-            let iter = stream::iter(iter::repeat(()).map(Ok::<(), Error>));
-            //let mut header_vec: Vec<u8> = vec![0;4];
-            let mut header_vec: Vec<u8> = vec![0;1];
-            let socket_reader = iter.fold((reader, header_vec), move | (reader, header_vec), _| {
-                let header = io::read_exact(reader, header_vec);
-                let header = header.and_then(|(reader, header_vec)|{
-                    if header_vec.len() == 0 {
-                        Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
-                    } else {
-
-                        Ok((reader, header_vec))
-                    }
-                });
-
-                let body = header.and_then(|(reader, header_vec)|{
-                    let body_len = header_vec[0] as usize; 
-                    let mut body_vec = vec![0; body_len];
-                    let body_inner = io::read_exact(reader, body_vec);
-                    let body_inner = body_inner.and_then(|(reader, body_vec)|{
-                        if body_vec.len() == 0 {
-                            Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
-                        } else {
-                            Ok((reader, header_vec, body_vec))
-                        }
-                    });
-                    body_inner
-                });
-
-                //let body = body.map(|(reader, vec)| {
-                body.map(|(reader, header_vec, body_vec)| {
-                   // (reader, String::from_utf8(vec))
-                    println!("{:?}", String::from_utf8(body_vec));
-                    (reader, header_vec)
-                })
-            });
-
-            let socket_reader = socket_reader.map_err(|_| ());
-            let connection = socket_reader.map(|_|());
-            handle.spawn(connection.then(move |_|{
-                println!("Connection {} closed.", addr);
-                Ok(())
-            }));
-
+        let srv = listener.incoming().for_each(move|(stream, _)|{
+            let id = id_source.get();
+            let channel_inner = channel.clone();
+            id_source.set(id + 1);
+            let handle_inner = handle.clone();
+            let connections_inner = connections.clone();
+            channel.send(NetEvent::CONNECTED(id)).unwrap();
+            Self::process_stream(id, handle_inner, stream, connections_inner, channel_inner);
             Ok(())
         });
 
         let srv = srv.map_err(|_|());
         let srv = srv.map(|_|());
         
-        let handle = self.core.handle();
-        handle.spawn(srv.then(move |_|{
+        handle_out.spawn(srv.then(move |_|{
             Ok(())
         }));
-
-//        self.core.run(srv).unwrap();
         Ok(())
     }
 
-    pub    fn start(&mut self) -> Result<()> {
+    pub fn process_send(id: usize, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, buf: Vec<u8>) {
+        match connections.borrow_mut().get_mut(&id) {
+            Some(tx) => {
+                tx.send(buf).unwrap();
+            },
+            None => {
+                println!("No Connection: {}!", id);
+            },
+        }
+
+    }
+
+
+    pub fn start(&mut self) -> Result<()> {
         let handle = self.core.handle();
-        let iter = stream::iter(iter::repeat(()).map(Ok::<(), Error>));
+        let handle_out = handle.clone();
+        let id_source = self.id.clone();
+        let connections = self.connections.clone();
+        let channel = self.channel.as_mut().unwrap().clone();
+/*        let iter = stream::iter(iter::repeat(()).map(Ok::<(), Error>));
         let timer = iter.fold(0, move |count, _| {
             let duration = Duration::new(1, 0);
             let time_out = Timeout::new(duration, &handle).unwrap();
@@ -244,8 +212,19 @@ impl NetService{
                 count + 1
             })
         });
-        
-        self.core.run(timer).unwrap();
+*/
+        let (tx, rx) = mpsc::unbounded();
+        self.commands = Some(tx);
+        let event_process = rx.fold(0, move |count, command|{
+            let handle_inner = handle_out.clone();
+            let id_inner = id_source.clone();
+            let connections_inner = connections.clone();
+            let channel_inner = channel.clone();
+            Self::process_command(handle_inner, id_inner, connections_inner, channel_inner, command);
+            Ok(count + 1)
+        }).map(|_|());
+
+        self.core.run(event_process).unwrap();
         Ok(())
     }
 }
