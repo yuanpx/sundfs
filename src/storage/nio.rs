@@ -44,7 +44,6 @@ pub struct NetService {
 
 impl NetService{
     pub fn new() -> Result<NetService> {
-        //let addr = try!(address.to_string().parse());
         let mut core = try!(Core::new());
         Ok(NetService{
         })

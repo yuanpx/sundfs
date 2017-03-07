@@ -28,16 +28,13 @@ use self::futures::sync::mpsc;
 use storage::nio::NetCommand;
 use storage::nio::NetEvent;
 use storage::nio::NetService;
-use storage;
 
 pub struct Service {
     cmd_channel: Option<UnboundedSender<NetCommand>>,
 }
 pub trait Process {
-    fn process_init(&mut self, service: &mut Service) {
-    }
-    fn process_event(&mut self, service: &mut Service, ev: NetEvent) {
-    }
+    fn process_init(&mut self, service: &mut Service); 
+    fn process_event(&mut self, service: &mut Service, ev: NetEvent);
 }
 
 impl Service {
