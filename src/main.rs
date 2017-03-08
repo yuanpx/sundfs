@@ -1,3 +1,4 @@
+mod raft;
 mod storage;
 use storage::nio::{NetService, NetEvent};
 use storage::logic::{Service, Process};
