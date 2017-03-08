@@ -28,15 +28,17 @@ use self::futures::sync::mpsc::UnboundedReceiver;
 use self::futures::sync::mpsc;
 
 pub enum NetCommand {
-    LISTEN(SocketAddr),
-    CONNECT(SocketAddr),
+    LISTEN((usize,SocketAddr)),
+    CONNECT((usize,SocketAddr)),
     SEND((usize, Vec<u8>)),
+    TIMEOUT((usize, usize)),
 }
 
 pub enum NetEvent {
-    CONNECTED(usize),
-    DISCONNECTED(usize),
+    CONNECTED((usize, usize)),
+    DISCONNECTED((usize, usize)),
     MESSAGE((usize, Vec<u8>)),
+    TIMEOUT(usize),
 }
 
 pub struct NetService {
@@ -51,20 +53,23 @@ impl NetService{
 
     pub fn process_command(handle: Handle, id_source: Rc<Cell<usize>>,connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, command: NetCommand) {
         match command {
-            NetCommand::LISTEN(address) => {
-                Self::process_listen(handle, id_source, connections,channel, &address).unwrap();
+            NetCommand::LISTEN((id,address)) => {
+                Self::process_listen(handle,id, id_source, connections,channel, &address).unwrap();
             },
-            NetCommand::CONNECT(address) => {
-                Self::process_connect(handle, id_source, connections, channel, &address).unwrap();
+            NetCommand::CONNECT((id,address)) => {
+                Self::process_connect(handle, id, id_source, connections, channel, &address).unwrap();
             },
             NetCommand::SEND((id, buf)) => {
                 Self::process_send(id, connections, buf);
                 
             },
+            NetCommand::TIMEOUT((id, sec)) => {
+                Self::process_timeout(handle, id, sec, channel).unwrap();
+            },
         }
     }
 
-    pub fn process_stream(id: usize, handle: Handle, stream: TcpStream, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>){
+    pub fn process_stream(event: usize, id: usize, handle: Handle, stream: TcpStream, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>){
         let handle_inner = handle.clone();
         let channel_out = channel.clone();
         let (tx, rx) = mpsc::unbounded();
@@ -119,18 +124,18 @@ impl NetService{
         let connection = connection.select(socket_writer);
         handle_inner.spawn(connection.then(move |_|{
             connections.borrow_mut().remove(&id).unwrap();
-            channel_out.send(NetEvent::DISCONNECTED(id)).unwrap();
+            channel_out.send(NetEvent::DISCONNECTED((event,id))).unwrap();
             Ok(())
         }));
     }
 
-    pub fn process_connect(handle: Handle, id_source: Rc<Cell<usize>>,connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, address: &SocketAddr) -> Result<()> {
+    pub fn process_connect(handle: Handle, event: usize, id_source: Rc<Cell<usize>>,connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, address: &SocketAddr) -> Result<()> {
         let id = id_source.get();
         id_source.set(id + 1);
         let handle_out = handle.clone();
          let stream = TcpStream::connect(address, &handle).map(move |stream| {
-             channel.send(NetEvent::CONNECTED(id)).unwrap();
-             Self::process_stream(id, handle, stream, connections, channel);
+             channel.send(NetEvent::CONNECTED((event, id))).unwrap();
+             Self::process_stream(event, id, handle, stream, connections, channel);
         });
 
         let stream = stream.map_err(|_|());
@@ -139,7 +144,7 @@ impl NetService{
         Ok(())
     }
     
-    pub fn process_listen(handle: Handle, id_source: Rc<Cell<usize>>, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, address: &SocketAddr) -> Result<()> {
+    pub fn process_listen(handle: Handle,event: usize, id_source: Rc<Cell<usize>>, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, address: &SocketAddr) -> Result<()> {
         let handle_out = handle.clone();
         let mut listener = try!(TcpListener::bind(address, &handle));
         let srv = listener.incoming().for_each(move|(stream, _)|{
@@ -148,8 +153,8 @@ impl NetService{
             id_source.set(id + 1);
             let handle_inner = handle.clone();
             let connections_inner = connections.clone();
-            channel.send(NetEvent::CONNECTED(id)).unwrap();
-            Self::process_stream(id, handle_inner, stream, connections_inner, channel_inner);
+            channel.send(NetEvent::CONNECTED((event, id))).unwrap();
+            Self::process_stream(event, id, handle_inner, stream, connections_inner, channel_inner);
             Ok(())
         });
 
@@ -162,6 +167,18 @@ impl NetService{
         Ok(())
     }
 
+    pub fn process_timeout(handle: Handle, event: usize, sec: usize, channel: UnboundedSender<NetEvent>) -> Result<()>{
+        let time = Duration::new(sec as u64, 0);
+        let timeout = Timeout::new(time, &handle).unwrap();
+        let timeout = timeout.map(move|_|{
+            channel.send(NetEvent::TIMEOUT(event)).unwrap();
+        });
+        let timeout = timeout.map_err(|_|());
+        let timeout = timeout.map(|_|());
+        handle.spawn(timeout);
+        Ok(())
+    }
+
     pub fn process_send(id: usize, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, buf: Vec<u8>) {
         match connections.borrow_mut().get_mut(&id) {
             Some(tx) => {
@@ -171,9 +188,7 @@ impl NetService{
                 println!("No Connection: {}!", id);
             },
         }
-
     }
-
 
     pub fn start(self) -> Result<(UnboundedSender<NetCommand>, UnboundedReceiver<NetEvent>)> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded();

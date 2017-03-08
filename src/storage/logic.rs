@@ -44,16 +44,20 @@ impl Service {
         }
     }
 
-    pub fn listen(&mut self, address: SocketAddr) {
-        self.cmd_channel.as_mut().unwrap().send(NetCommand::LISTEN(address)).unwrap();
+    pub fn listen(&mut self, id: usize, address: SocketAddr) {
+        self.cmd_channel.as_mut().unwrap().send(NetCommand::LISTEN((id,address))).unwrap();
     }
 
-    pub fn connect(&mut self, address: SocketAddr) {
-        self.cmd_channel.as_mut().unwrap().send(NetCommand::CONNECT(address)).unwrap();
+    pub fn connect(&mut self, id: usize, address: SocketAddr) {
+        self.cmd_channel.as_mut().unwrap().send(NetCommand::CONNECT((id,address))).unwrap();
     }
 
     pub fn send(&mut self, id: usize, buf: Vec<u8>) {
         self.cmd_channel.as_mut().unwrap().send(NetCommand::SEND((id, buf))).unwrap();
+    }
+
+    pub fn timeout(&mut self, id: usize, sec: usize) {
+        self.cmd_channel.as_mut().unwrap().send(NetCommand::TIMEOUT((id, sec))).unwrap();
     }
 
     pub fn start<T: Process>(&mut self, process: &mut T) -> Result<()> {
