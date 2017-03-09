@@ -32,6 +32,7 @@ pub enum NetCommand {
     CONNECT((usize,SocketAddr)),
     SEND((usize, Vec<u8>)),
     TIMEOUT((usize, usize)),
+    CANCEL_TIMEOUT(usize),
 }
 
 pub enum NetEvent {
@@ -42,6 +43,7 @@ pub enum NetEvent {
 }
 
 pub struct NetService {
+
 }
 
 impl NetService{
@@ -51,7 +53,7 @@ impl NetService{
         })
     }
 
-    pub fn process_command(handle: Handle, id_source: Rc<Cell<usize>>,connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, channel: UnboundedSender<NetEvent>, command: NetCommand) {
+    pub fn process_command(handle: Handle, id_source: Rc<Cell<usize>>,connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, timeouts: Rc<RefCell<HashMap<usize, UnboundedSender<()>>>>, channel: UnboundedSender<NetEvent>, command: NetCommand) {
         match command {
             NetCommand::LISTEN((id,address)) => {
                 Self::process_listen(handle,id, id_source, connections,channel, &address).unwrap();
@@ -61,10 +63,12 @@ impl NetService{
             },
             NetCommand::SEND((id, buf)) => {
                 Self::process_send(id, connections, buf);
-                
             },
             NetCommand::TIMEOUT((id, sec)) => {
-                Self::process_timeout(handle, id, sec, channel).unwrap();
+                Self::process_timeout(handle, id, sec, timeouts, channel).unwrap();
+            },
+            NetCommand::CANCEL_TIMEOUT(id) => {
+                Self::process_cancel_timeout(id, timeouts);
             },
         }
     }
@@ -167,16 +171,39 @@ impl NetService{
         Ok(())
     }
 
-    pub fn process_timeout(handle: Handle, event: usize, sec: usize, channel: UnboundedSender<NetEvent>) -> Result<()>{
+    pub fn process_timeout(handle: Handle, event: usize, sec: usize, timeouts: Rc<RefCell<HashMap<usize, UnboundedSender<()>>>>,channel: UnboundedSender<NetEvent>) -> Result<()>{
         let time = Duration::new(sec as u64, 0);
+        let (cancel_tx, cancel_rx) = mpsc::unbounded::<()>();
+        timeouts.borrow_mut().insert(event, cancel_tx);
+
         let timeout = Timeout::new(time, &handle).unwrap();
         let timeout = timeout.map(move|_|{
+            timeouts.borrow_mut().remove(&event);
             channel.send(NetEvent::TIMEOUT(event)).unwrap();
         });
         let timeout = timeout.map_err(|_|());
-        let timeout = timeout.map(|_|());
-        handle.spawn(timeout);
+
+        let cancel = cancel_rx.into_future();
+        let cancel = cancel.map_err(|_|());
+        let cancel = cancel.map(|_|());
+
+        let timeout = timeout.select(cancel);
+        handle.spawn(timeout.then(|_|Ok(())));
         Ok(())
+    }
+
+    pub fn process_cancel_timeout(event: usize, timeouts: Rc<RefCell<HashMap<usize, UnboundedSender<()>>>>) -> Result<()> {
+        match timeouts.borrow_mut().remove(&event) {
+            Some(tx) => {
+                tx.send(()).unwrap();
+                Ok(())
+            },
+            _ => {
+               Ok(()) 
+            },
+        }
+        
+        
     }
 
     pub fn process_send(id: usize, connections: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>>, buf: Vec<u8>) {
@@ -200,14 +227,17 @@ impl NetService{
             let id = Rc::new(Cell::new(0));
             let id_source = id.clone();
             let connections_out: Rc<RefCell<HashMap<usize, UnboundedSender<Vec<u8>>>>> =  Rc::new(RefCell::new(HashMap::new()));
+            let timeouts_out: Rc<RefCell<HashMap<usize, UnboundedSender<()>>>> = Rc::new(RefCell::new(HashMap::new()));
             let connections = connections_out.clone();
+            let timeouts = timeouts_out.clone();
             let event_tx_inner = event_tx.clone();
             let event_process = cmd_rx.fold(0, move |count, command|{
                 let handle_inner = handle_out.clone();
                 let id_inner = id_source.clone();
                 let connections_inner = connections.clone();
+                let timeouts_inner = timeouts.clone();
                 let channel_inner = event_tx_inner.clone();
-                Self::process_command(handle_inner, id_inner, connections_inner, channel_inner, command);
+                Self::process_command(handle_inner, id_inner, connections_inner, timeouts_inner, channel_inner, command);
                 Ok(count + 1)
             }).map(|_|());
             

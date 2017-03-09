@@ -60,6 +60,10 @@ impl Service {
         self.cmd_channel.as_mut().unwrap().send(NetCommand::TIMEOUT((id, sec))).unwrap();
     }
 
+    pub fn cancel_timeout(&mut self, id: usize) {
+        self.cmd_channel.as_mut().unwrap().send(NetCommand::CANCEL_TIMEOUT(id)).unwrap();
+    }
+
     pub fn start<T: Process>(&mut self, process: &mut T) -> Result<()> {
         let mut core = Core::new().unwrap();
         let mut net_service = NetService::new().unwrap();

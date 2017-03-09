@@ -48,7 +48,7 @@ enum Log {
 
 enum Message {
     REQUESTVOTE(),
-    APPENDENTRIES(),
+    APPENDENTRY(),
     HEARTBEAT(),
 }
 
@@ -60,6 +60,12 @@ struct RequestVote{
 struct ResponseVote {
     term: usize,
 }
+
+struct AppendEntry{
+    term: usize,
+}
+
+
 
 
 
@@ -150,12 +156,11 @@ impl Raft {
                 self.become_candidate();
             },
             _ => {
-                
             },
         };
     }
 
-    fn process_appendentries(&mut self) {
+    fn process_appendentries(&mut self, entry: AppendEntry) {
         
     }
 
@@ -163,7 +168,7 @@ impl Raft {
         
     }
 
-    fn process_requestvote(&mut self) {
+    fn process_requestvote(&mut self, request: RequestVote) {
         
     }
 
